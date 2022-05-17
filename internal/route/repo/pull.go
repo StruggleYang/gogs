@@ -731,7 +731,7 @@ func CompareAndPullRequestPost(c *context.Context, f form.NewIssue) {
 	}
 	// FIXME: check error in the case two people send pull request at almost same time, give nice error prompt
 	// instead of 500.
-	if err := db.NewPullRequest(repo, pullIssue, labelIDs, attachments, pullRequest, patch); err != nil {
+	if err := db.NewPullRequestNew(repo, pullIssue, labelIDs, attachments, pullRequest, patch); err != nil {
 		c.Error(err, "new pull request")
 		return
 	} else if err := pullRequest.PushToBaseRepo(); err != nil {

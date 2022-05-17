@@ -443,6 +443,81 @@ func (pr *PullRequest) testPatch() (err error) {
 	return nil
 }
 
+// testPrMerge Check if the PR's contrast branch can be merged into the base repository without conflicts.
+// TODO the function replace testPatch
+func (pr *PullRequest) testPrMerge() (err error) {
+	if pr.BaseRepo == nil {
+		pr.BaseRepo, err = GetRepositoryByID(pr.BaseRepoID)
+		if err != nil {
+			return fmt.Errorf("GetRepositoryByID: %v", err)
+		}
+	}
+
+	headRepoPath := RepoPath(pr.HeadUserName, pr.HeadRepo.Name)
+	_, err = git.Open(headRepoPath)
+	if err != nil {
+		return fmt.Errorf("open repository: %v", err)
+	}
+
+	repoWorkingPool.CheckIn(com.ToStr(pr.BaseRepoID))
+	defer repoWorkingPool.CheckOut(com.ToStr(pr.BaseRepoID))
+
+	// Create temporary directory to store temporary copy of the base repository,
+	// and clean it up when operation finished regardless of succeed or not.
+	tmpRepoName := com.ToStr(time.Now().Nanosecond())
+	headRepo := "pr_checking_" + tmpRepoName + "_head_repo"
+	tmpBasePath := filepath.Join(conf.Server.AppDataPath, "tmp", "pr_checking", tmpRepoName+".git")
+	if err = os.MkdirAll(filepath.Dir(tmpBasePath), os.ModePerm); err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.RemoveAll(filepath.Dir(tmpBasePath))
+	}()
+
+	// Clone the base repository to the defined temporary directory,
+	// and checks out to base branch directly.
+	var stderr string
+	if _, stderr, err = process.ExecTimeout(5*time.Minute,
+		fmt.Sprintf("PullRequest.testPrMerge (git clone): %s", tmpBasePath),
+		"git", "clone", "-b", pr.BaseBranch, headRepoPath, tmpBasePath); err != nil {
+		return fmt.Errorf("git clone: %s", stderr)
+	}
+
+	// Add remote which points to the head repository.
+	if _, stderr, err = process.ExecDir(-1, tmpBasePath,
+		fmt.Sprintf("PullRequest.testPrMerge (git remote add): %s", tmpBasePath),
+		"git", "remote", "add", headRepo, headRepoPath); err != nil {
+		return fmt.Errorf("git remote add [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
+	}
+
+	// Fetch information from head repository to the temporary copy.
+	if _, stderr, err = process.ExecDir(-1, tmpBasePath,
+		fmt.Sprintf("PullRequest.testPrMerge (git fetch): %s", tmpBasePath),
+		"git", "fetch", headRepo); err != nil {
+		return fmt.Errorf("git fetch [%s -> %s]: %s", headRepoPath, tmpBasePath, stderr)
+	}
+
+	remoteHeadBranch := headRepo + "/" + pr.HeadBranch
+
+	log.Trace("PullRequest[%d].testPrMerge (tmpBasePath): %s", pr.ID, tmpBasePath)
+
+	pr.Status = PULL_REQUEST_STATUS_CHECKING
+	// TODO Just checking, no real merging
+	// Merge changes from head branch in temp directory ，Just checking
+	_, stderr, err = process.ExecDir(-1, tmpBasePath,
+		fmt.Sprintf("PullRequest.testPrMerge (git merge --no-ff --no-commit): %s", tmpBasePath),
+		"git", "merge", "--no-ff", "--no-commit", remoteHeadBranch)
+
+	if err != nil {
+		fmt.Printf("testPrMerge error %s ,%s\n", stderr, err.Error())
+		log.Trace("PullRequest[%d].testPrMerge (merge test): has conflict\n%s\n%s", pr.ID, stderr, err.Error())
+		pr.Status = PULL_REQUEST_STATUS_CONFLICT
+		log.Trace("git merge --no-ff --no-commit [%s]: %v - %s\n%s", tmpBasePath, err, stderr, err.Error())
+		return nil
+	}
+	return nil
+}
+
 // NewPullRequest creates new pull request with labels for repository.
 func NewPullRequest(repo *Repository, pull *Issue, labelIDs []int64, uuids []string, pr *PullRequest, patch []byte) (err error) {
 	sess := x.NewSession()
@@ -469,6 +544,77 @@ func NewPullRequest(repo *Repository, pull *Issue, labelIDs []int64, uuids []str
 	pr.BaseRepo = repo
 	if err = pr.testPatch(); err != nil {
 		return fmt.Errorf("testPatch: %v", err)
+	}
+	// No conflict appears after test means mergeable.
+	if pr.Status == PULL_REQUEST_STATUS_CHECKING {
+		pr.Status = PULL_REQUEST_STATUS_MERGEABLE
+	}
+
+	pr.IssueID = pull.ID
+	if _, err = sess.Insert(pr); err != nil {
+		return fmt.Errorf("insert pull repo: %v", err)
+	}
+
+	if err = sess.Commit(); err != nil {
+		return fmt.Errorf("Commit: %v", err)
+	}
+
+	if err = NotifyWatchers(&Action{
+		ActUserID:    pull.Poster.ID,
+		ActUserName:  pull.Poster.Name,
+		OpType:       ACTION_CREATE_PULL_REQUEST,
+		Content:      fmt.Sprintf("%d|%s", pull.Index, pull.Title),
+		RepoID:       repo.ID,
+		RepoUserName: repo.Owner.Name,
+		RepoName:     repo.Name,
+		IsPrivate:    repo.IsPrivate,
+	}); err != nil {
+		log.Error("NotifyWatchers: %v", err)
+	}
+	if err = pull.MailParticipants(); err != nil {
+		log.Error("MailParticipants: %v", err)
+	}
+
+	pr.Issue = pull
+	pull.PullRequest = pr
+	if err = PrepareWebhooks(repo, HOOK_EVENT_PULL_REQUEST, &api.PullRequestPayload{
+		Action:      api.HOOK_ISSUE_OPENED,
+		Index:       pull.Index,
+		PullRequest: pr.APIFormat(),
+		Repository:  repo.APIFormat(nil),
+		Sender:      pull.Poster.APIFormat(),
+	}); err != nil {
+		log.Error("PrepareWebhooks: %v", err)
+	}
+
+	return nil
+}
+
+// NewPullRequestNew creates new pull request with labels for repository.
+// TODO Modify the PR check mechanism to directly perform a merge operation in the temporary directory, instead of using the apply patch method
+// TODO the function replace NewPullRequest
+func NewPullRequestNew(repo *Repository, pull *Issue, labelIDs []int64, uuids []string, pr *PullRequest, patch []byte) (err error) {
+	sess := x.NewSession()
+	defer sess.Close()
+	if err = sess.Begin(); err != nil {
+		return err
+	}
+
+	if err = newIssue(sess, NewIssueOptions{
+		Repo:        repo,
+		Issue:       pull,
+		LableIDs:    labelIDs,
+		Attachments: uuids,
+		IsPull:      true,
+	}); err != nil {
+		return fmt.Errorf("newIssue: %v", err)
+	}
+
+	pr.Index = pull.Index
+	pr.BaseRepo = repo
+	//real：git merge --no-ff --no-commit branch
+	if err = pr.testPrMerge(); err != nil {
+		return fmt.Errorf("testPrMerge: %v", err)
 	}
 	// No conflict appears after test means mergeable.
 	if pr.Status == PULL_REQUEST_STATUS_CHECKING {
@@ -860,8 +1006,8 @@ func TestPullRequests() {
 				return nil
 			}
 
-			if err := pr.testPatch(); err != nil {
-				log.Error("testPatch: %v", err)
+			if err := pr.testPrMerge(); err != nil {
+				log.Error("testPrMerge: %v", err)
 				return nil
 			}
 			prs = append(prs, pr)
@@ -882,8 +1028,8 @@ func TestPullRequests() {
 		if err != nil {
 			log.Error("GetPullRequestByID[%s]: %v", prID, err)
 			continue
-		} else if err = pr.testPatch(); err != nil {
-			log.Error("testPatch[%d]: %v", pr.ID, err)
+		} else if err = pr.testPrMerge(); err != nil {
+			log.Error("testPrMerge[%d]: %v", pr.ID, err)
 			continue
 		}
 
